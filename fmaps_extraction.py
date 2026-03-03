@@ -3,31 +3,102 @@ import torch
 import os
 from tqdm import tqdm
 from src.feature_extraction_utils import FeatureExtractor, grad_cam
+import sys
+import torch.nn as nn
+from torchvision import models
+
+
+device = torch.device("cpu")
+
+
+class ModifiedResNet18(nn.Module):
+    def __init__(self, num_classes, reduced_channels):
+        super(ModifiedResNet18, self).__init__()
+        original_resnet = models.resnet18(weights="DEFAULT")
+
+        # Keep all layers up to layer3 (optional for now)
+        self.features = nn.Sequential(
+            original_resnet.conv1,
+            original_resnet.bn1,
+            original_resnet.relu,
+            original_resnet.maxpool,
+            original_resnet.layer1,
+            nn.ReLU(inplace=False),
+            original_resnet.layer2,
+            nn.ReLU(inplace=False),
+            original_resnet.layer3,
+            nn.ReLU(inplace=False),
+            #original_resnet.layer4,
+            #nn.ReLU(inplace=False),
+        )
+
+        self.reduce = nn.Sequential(
+            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_features=256),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(in_channels=256, out_channels=reduced_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_features=reduced_channels),
+            nn.ReLU(inplace=False),
+        )
+        #self.reduce =nn.Sequential(nn.Conv2d(256, reduced_channels, kernel_size=3,padding=1),nn.BatchNorm2d(reduced_channels),nn.ReLU(inplace=False))
+
+        # Classifier
+
+        self.classifier = nn.Linear(reduced_channels*14**2, num_classes) # we have a better resolution of 14x14 after the last conv layer
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.reduce(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
 
 
 ##### Load test dataset and the model
 cwd = os.getcwd()
-test_dataset=torch.load(os.path.join(cwd, "dataset", "test_dataset.pt"), weights_only=False)
-n_feature_last_block = 64
-model = torch.load(os.path.join(cwd, "trained_model", f"model_{n_feature_last_block}_features_trained_20_epochs"), map_location="cpu", weights_only=False)
+test_dataset = torch.load(os.path.join(cwd, "dataset", "test_dataset.pth"), weights_only=False)
+#fmaps = int(sys.argv[1]); epochs = int(sys.argv[2])
+fmaps = 128; epochs = 16
+
+model = ModifiedResNet18(num_classes=10, reduced_channels=fmaps)
+state_dict = torch.load(
+    os.path.join(cwd, "checkpoints", f"checkpoint_ep{epochs}_fullResnetMod{fmaps}.pth"),
+    map_location=device
+)
+model.load_state_dict(state_dict['model_state_dict'])
+model.to(device)
+
+#model = torch.load(os.path.join(cwd, "checkpoints", f"checkpoint_ep{epochs}_fullResnetMod{fmaps}.pth"), map_location="cpu", weights_only=False)
 model.eval()
 
 
 ## we store only the correectly classified images
 ref_labels = np.arange(10)
 class_inputs = []
+correct_classified = {}
 
 for ref_label in ref_labels:
     inputs = []
+    count = 0
+    correct_classified[str(ref_label)] = count
     for i in range(len(test_dataset)):
         img, label = test_dataset[i]
         if label == ref_label:
             inputs.append(img)
+            count += 1
+            correct_classified[str(ref_label)] = count
 
     class_inputs.append(inputs)
 
+
+print(correct_classified)
+list_of_correct_classified = [correct_classified[str(ref_label)] for ref_label in ref_labels]
+#print(list_of_correct_classified)
+min_n = min(list_of_correct_classified)
+print(min_n)
+
 ## we select a reasonable number of images for each class (N_tot = 20 * 10 = 200)
-n_samples = 20
+n_samples = min_n
 features_selected_per_class = []
 accuracy_per_class = []
 optimal_solutions_per_class = []
@@ -45,6 +116,7 @@ for r, inputs in enumerate(class_inputs):
         extractor = FeatureExtractor()
         extractor.set_model(model)
         extractor.set_target_layer(model.reduce[-1])  # Target layer from model
+        #print("Output", model.reduce[-1])
         extractor.set_input_tensor(img_tensor, see_picture=False)
 
         extractor.register_hooks()
@@ -85,7 +157,7 @@ for r, inputs in enumerate(class_inputs):
             save_dir = os.path.join(
                 cwd,
                 "fmaps",
-                f"model{n_feature_last_block}_fmaps"
+                f"model{fmaps}_fmaps"
             )
 
             os.makedirs(save_dir, exist_ok=True)
@@ -97,9 +169,13 @@ for r, inputs in enumerate(class_inputs):
 
             np.savez(
                 file_path,
+                image=input_tensor.cpu().numpy(),
                 class_id=r,
                 dataset_idx=idx,
                 pred=pred,
                 pos_indices=sorted_indices,
-                alpha=alpha
+                alpha=alpha,
+                feature_maps = features.cpu().numpy(),
+                gradients = gradients.cpu().numpy(),
+                grad_cams = gradcam,
             )
